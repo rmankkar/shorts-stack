@@ -1,0 +1,288 @@
+
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+JOB_DIR = Path(sys.argv[1] if len(sys.argv) > 1 else "/data/jobs/test")
+API_KEY = os.environ.get("PIXABAY_API_KEY", "").strip()
+TARGET_W, TARGET_H = 1080, 1920
+
+STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "to", "of", "in",
+    "on", "for", "with", "is", "are", "was", "were", "just",
+    "this", "that", "it", "its", "how", "why", "what", "new",
+    "after", "from", "has", "have", "will", "could", "their",
+    "they", "you", "your", "about", "into", "than", "more",
+    "over", "under", "up", "down", "as", "at", "by", "be"
+}
+
+
+def keywords(text, limit=8):
+    words = re.findall(r"[a-zA-Z0-9]+", text.lower())
+    result = []
+    for word in words:
+        if len(word) > 2 and word not in STOPWORDS and word not in result:
+            result.append(word)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def search_phrases(script):
+    title_words = keywords(script.get("title", ""), 5)
+    narration_words = keywords(script.get("narration", ""), 12)
+
+    phrases = []
+    if title_words:
+        phrases.append(" ".join(title_words[:3]))
+        phrases.append(" ".join(title_words[:2]))
+
+    # Search specific story terms, not a generic fallback.
+    if len(narration_words) >= 3:
+        phrases.append(" ".join(narration_words[:3]))
+    if len(narration_words) >= 6:
+        phrases.append(" ".join(narration_words[3:6]))
+
+    unique = []
+    for phrase in phrases:
+        if phrase and phrase not in unique:
+            unique.append(phrase)
+
+    return unique[:4]
+
+
+def api_search(query):
+    params = urllib.parse.urlencode({
+        "key": API_KEY,
+        "q": query[:100],
+        "per_page": 20,
+        "safesearch": "true",
+        "video_type": "all",
+        "min_width": 1280,
+        "min_height": 720,
+        "order": "popular"
+    })
+
+    request = urllib.request.Request(
+        "https://pixabay.com/api/videos/?" + params,
+        headers={"User-Agent": "ShortsWorker/1.0"}
+    )
+
+    with urllib.request.urlopen(request, timeout=40) as response:
+        data = json.loads(response.read().decode("utf-8"))
+
+    return data.get("hits", [])
+
+
+def choose_file(video):
+    variants = video.get("videos", {})
+    choices = []
+
+    for name, item in variants.items():
+        width = item.get("width", 0)
+        height = item.get("height", 0)
+        url = item.get("url", "")
+
+        if not url or width < 1280 or height < 720:
+            continue
+
+        choices.append((width * height, item))
+
+    if not choices:
+        return None
+
+    # Prefer highest pixel count available.
+    choices.sort(key=lambda entry: entry[0], reverse=True)
+    return choices[0][1]
+
+
+def score_video(video, query_terms):
+    tags = set(keywords(video.get("tags", ""), 30))
+    query_terms = set(query_terms)
+
+    if not query_terms:
+        return 0
+
+    overlap = len(tags & query_terms)
+    title_overlap = len(
+        set(keywords(video.get("tags", ""), 30)) & query_terms
+    )
+
+    # Require at least one meaningful tag match.
+    if overlap == 0:
+        return 0
+
+    duration = video.get("duration", 0)
+    if duration < 5:
+        return 0
+
+    file_info = choose_file(video)
+    if not file_info:
+        return 0
+
+    width = file_info.get("width", 0)
+    height = file_info.get("height", 0)
+
+    score = overlap * 10
+    score += min(video.get("likes", 0), 100) / 20
+    score += min(video.get("downloads", 0), 1000) / 200
+
+    if height > width:
+        score += 3
+
+    if width >= 1920 or height >= 1920:
+        score += 2
+
+    return score
+
+
+def download(url, destination):
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "ShortsWorker/1.0"}
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        destination.write_bytes(response.read())
+
+
+def make_vertical_clip(source, destination):
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-i", str(source),
+        "-t", "8",
+        "-vf",
+        "scale=1080:1920:force_original_aspect_ratio=increase:"
+        "flags=lanczos,crop=1080:1920,setsar=1,fps=30,"
+        "format=yuv420p",
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
+        "-movflags", "+faststart",
+        str(destination)
+    ], check=True, capture_output=True, text=True, timeout=240)
+
+
+def main():
+    if not API_KEY:
+        raise RuntimeError("PIXABAY_API_KEY is missing.")
+
+    with (JOB_DIR / "script.json").open(encoding="utf-8") as f:
+        script = json.load(f)
+
+    phrases = search_phrases(script)
+    if not phrases:
+        raise RuntimeError("Could not extract useful search terms from script.")
+
+    print("Pixabay search phrases:", phrases)
+
+    candidates = {}
+    for phrase in phrases:
+        try:
+            for video in api_search(phrase):
+                video_id = video.get("id")
+                if video_id is not None:
+                    previous = candidates.get(video_id)
+                    score = score_video(video, keywords(phrase, 10))
+                    if previous is None or score > previous["score"]:
+                        candidates[video_id] = {
+                            "video": video,
+                            "score": score,
+                            "query": phrase
+                        }
+        except Exception as exc:
+            print(f"Search failed for '{phrase}': {exc}")
+
+    ranked = sorted(
+        candidates.values(),
+        key=lambda item: item["score"],
+        reverse=True
+    )
+
+    # Use only relevant clips. No unrelated generic footage fallback.
+    ranked = [item for item in ranked if item["score"] > 0][:3]
+
+    if not ranked:
+        raise RuntimeError(
+            "No relevant high-resolution clips found. "
+            "Try refining the headline/narration or search terms."
+        )
+
+    assets = JOB_DIR / "assets"
+    assets.mkdir(parents=True, exist_ok=True)
+
+    processed = []
+    metadata = []
+
+    for item in ranked:
+        video = item["video"]
+        index = len(processed) + 1
+        file_info = choose_file(video)
+
+        source = assets / f"source_{index}.mp4"
+        scene = assets / f"scene_{index}.mp4"
+
+        try:
+            print(
+                f"Using Pixabay video {video.get('id')}, "
+                f"score={item['score']}, query='{item['query']}', "
+                f"tags='{video.get('tags', '')}'"
+            )
+
+            download(file_info["url"], source)
+            make_vertical_clip(source, scene)
+
+            processed.append(scene)
+            metadata.append({
+                "id": video.get("id"),
+                "query": item["query"],
+                "score": item["score"],
+                "tags": video.get("tags"),
+                "source_url": video.get("pageURL"),
+                "creator": video.get("user"),
+                "source_width": file_info.get("width"),
+                "source_height": file_info.get("height")
+            })
+
+        except Exception as exc:
+            print(f"Skipping video {video.get('id')}: {exc}")
+            source.unlink(missing_ok=True)
+            scene.unlink(missing_ok=True)
+
+    if not processed:
+        raise RuntimeError("All selected Pixabay clips failed processing.")
+
+    concat_file = assets / "concat.txt"
+    with concat_file.open("w", encoding="utf-8") as f:
+        for clip in processed:
+            # Paths use our generated safe filenames.
+            f.write(f"file '{clip}'\n")
+
+    output = JOB_DIR / "visuals.mp4"
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", str(concat_file),
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        str(output)
+    ], check=True, timeout=300)
+
+    with (JOB_DIR / "visual_credits.json").open(
+        "w", encoding="utf-8"
+    ) as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+    print(f"Created {output} using {len(processed)} relevant clips.")
+
+
+if __name__ == "__main__":
+    main()

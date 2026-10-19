@@ -1,0 +1,20 @@
+/.DS_Store
+# Generated video jobs and media
+workspace/
+*.mp4
+*.mp3
+*.wav
+*.srt
+
+# Generated visual assets
+assets/
+visuals.mp4
+visual_credits.json
+
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/

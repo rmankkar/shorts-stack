@@ -1,0 +1,38 @@
+services:
+  n8n:
+    build: .
+    container_name: shorts-n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - TZ=Asia/Kolkata
+      - GENERIC_TIMEZONE=Asia/Kolkata
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+      - N8N_ALLOW_EXECUTE_COMMAND=true
+      - NODES_EXCLUDE=[]
+      - N8N_RUNNERS_ENABLED=true
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./workspace:/data
+      - ./scripts:/opt/shorts-scripts:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+  shorts-worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    container_name: shorts-worker
+    restart: unless-stopped
+    volumes:
+      - ./workspace:/data
+      - ./scripts:/opt/shorts-scripts:ro
+    expose:
+      - "8000"
+    environment:
+      - PIXABAY_API_KEY=${PIXABAY_API_KEY}
+
+volumes:
+  n8n_data:
